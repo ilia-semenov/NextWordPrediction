@@ -1,0 +1,386 @@
+---
+title: "Text Input Recommendation System: Introductory Report"
+subtitle: "JHU/Swiftkey Data Science Capstone project"
+author: "Ilia Semenov"
+date: "March 20, 2016"
+output: html_document
+---
+```{r, echo=FALSE,message=FALSE}
+library('tm')
+library('SnowballC')
+library('wordcloud')
+library('printr')
+library('scales')
+library('ggplot2')
+library('RWeka')
+library('gridExtra')
+
+set.seed(125)
+#functions
+loadCorpus<-function(path,pattern){
+        flist<-list.files(path = path,pattern =pattern,recursive=T)
+        dir<-paste(head(unlist(strsplit(flist[1],'/')),
+                        n=length(unlist(strsplit(flist[1],'/')))-1),collapse = "/")
+        corpus <- VCorpus(DirSource(dir, encoding = "UTF-8"), 
+                             readerControl = list(language = "en"))
+        return (corpus)
+}
+
+corpusInfo<-function(corpus){
+        info<-c()
+        for (i in 1:length(names(corpus))) {
+                doc<-corpus[[i]][[1]]
+                size<-as.numeric(object.size(doc))/1024/1024
+                nlines<-length(doc)
+                chars<-sapply(doc, nchar)
+                nchars<-sum(chars)
+                minchars<-min(chars)
+                avchars<-nchars/nlines
+                maxchars<-max(chars)
+                wds<-sapply(gregexpr("\\S+", doc), length)
+                nwds<-sum(wds)
+                minwds<-min(wds)
+                avwds<-nwds/nlines
+                maxwds<-max(wds)
+                info<-c(info,size,nlines,nchars,minchars,avchars,maxchars,
+                        nwds,minwds,avwds,maxwds)
+        }
+        infotable<-matrix(info,ncol=10,byrow=TRUE)
+        rownames(infotable)<-c(names(corpus))
+        colnames(infotable)<-c("File size (MB)","Total lines", "Total charachters",
+                               "Min charachters per line","Average charachters per line",
+                               "Max charachters per line","Total words",
+                               "Min words per line","Average words per line",
+                               "Max words per line")
+        totals<-c(sum(as.numeric(infotable[,1])),sum(infotable[,2]),sum(infotable[,3]),
+                  min(infotable[,4]),sum(infotable[,3])/sum(infotable[,2]),
+                  max(infotable[,6]),sum(infotable[,7]),min(infotable[,8]),
+                  sum(infotable[,7])/sum(infotable[,2]),max(infotable[,10]))
+        infotable<-rbind(infotable,totals)
+        infotable<-round(infotable,0)
+        rownames(infotable)<-c(names(corpus),"Corpus")
+        return(t(infotable))
+}
+
+cleanCorpus<-function(corpus){
+        #download bad words dicionary (english)
+        if (!file.exists('./data/bad-words.txt')){
+        download.file('http://www.cs.cmu.edu/~biglou/resources/bad-words.txt', 
+                destfile='./data/bad-words.txt', method="curl")
+        }
+        en_bad_wds<-readLines('./data/bad-words.txt')
+        en_bad_wds<-en_bad_wds[-1]
+        names.corpus<-names(corpus)
+        #remove special charachters
+        for(i in seq(corpus)) {   
+             corpus[[i]][[1]]<-gsub("[][#$%*<=>@^_`|~.{}']", "", corpus[[i]][[1]])
+             corpus[[i]][[1]]<-gsub("[^[:graph:]]", " ",corpus[[i]][[1]])
+             corpus[[i]][[1]]<-gsub("&", " and ",corpus[[i]][[1]])
+             
+        }
+        #stemming
+        #corpus <- tm_map(corpus, stemDocument)
+        #to lower case
+        corpus<-tm_map(corpus, tolower)
+        #remove stopwords
+        #corpus<-tm_map(corpus, removeWords, stopwords("english"))
+        #remove punctuation
+        corpus<-tm_map(corpus, removePunctuation)
+        #remove numbers
+        corpus<-tm_map(corpus, removeNumbers)
+        #remove bad words (english)
+        corpus<-tm_map(corpus, removeWords, en_bad_wds)
+        #strip whitespaces
+        corpus<-tm_map(corpus, stripWhitespace)
+        #plain text
+        corpus<-tm_map(corpus, PlainTextDocument)
+        names(corpus)<-names.corpus
+        return(corpus)
+}
+
+sampleCorpus<-function(corpus,n){
+         for(i in seq(corpus)) {   
+             corpus[[i]][[1]]<-sample(corpus[[i]][[1]],n)  
+         }
+        return(corpus)
+}
+
+
+unigramDTM<-function(corpus){
+        dtm<-DocumentTermMatrix(corpus)
+        mdtm<-as.matrix(dtm)
+        return(list(dtm,mdtm))
+}
+
+bigramDTM<-function(corpus){
+        bigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+        dtm<-DocumentTermMatrix(us_corpus_samp,control = list(tokenize = bigramTokenizer))
+        mdtm<-as.matrix(dtm)
+        return(list(dtm,mdtm))
+}
+
+trigramDTM<-function(corpus){
+        trigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 3, max = 3))
+        dtm<-DocumentTermMatrix(us_corpus_samp,control = list(tokenize = trigramTokenizer))
+        mdtm<-as.matrix(dtm)
+        return(list(dtm,mdtm))
+}
+
+dtmInfo<-function(m){
+        freq<-colSums(m)
+        infotable<-matrix(rep(0,20),ncol=5,byrow=T)
+        infotable[,1]<-c(rowSums(m),sum(freq))
+        infotable[,2]<-c(apply(m,1,function(x) length(which(x!=0))),length(freq))
+        infotable[,3]<-c(apply(m,1,function(x) length(which(cumsum(x[order(x,decreasing=T)])/sum(x)<=0.9))),
+                         length(which(cumsum(freq[order(freq,decreasing=T)])/sum(freq)<=0.9)))
+        infotable[,4]<-percent(c(apply(m,1,function(x) length(which(x==0))/length(x)),
+                         length(which(m==0))/length(m)))
+        infotable[,5]<-c(apply(m,1,function(x) names(which(x==max(x)))[1]),
+                         names(which(freq==max(freq)))[1])
+        
+        rownames(infotable)<-c(rownames(m),"Corpus")
+        colnames(infotable)<-c("Total words", "Total unique words",
+                               "Total unique words covering 90% of text",
+                               "Sparcity %", "Most frequent word")
+        return(t(infotable))        
+
+}
+
+wdsChart<-function(m,t){
+        freq<-sort(colSums(m), decreasing=TRUE)
+        df<-data.frame(wds=names(freq),freq=freq)
+        df$wds<-factor(df$wds,levels=df$wds)
+        p<-ggplot(df[1:10,],aes(wds,freq)) +
+                geom_bar(stat="identity") +
+                labs(x='Ngrams', y="Frequency") +
+                ggtitle(t) +
+                theme(axis.text.x = element_text(size=10,
+                                                 angle = 90, hjust = 1))
+        return(p)
+}
+
+histChart<-function(m,t){
+        freq<-sort(colSums(m), decreasing=TRUE)
+        df<-data.frame(wds=names(freq),freq=freq)
+        df$wds<-factor(df$wds,levels=df$wds)
+        p<-ggplot(df,aes(x=freq)) + 
+                geom_histogram() +
+                labs(x='Ngram length', y="Frequency") +
+                ggtitle(t)
+        return(p)
+}
+
+wordCloud<-function(uni,bi,tri){
+        ufreq<-colSums(uni)
+        bfreq<-colSums(bi)
+        tfreq<-colSums(tri)
+        cfreq<-sort(c(ufreq,bfreq,tfreq),decreasing=T)
+        wcl<-wordcloud(names(cfreq),cfreq,
+                       max.words = 50, scale=c(5,0.5), 
+                  colors= pal <- brewer.pal(9,"BuGn"))
+        return(wcl)
+}
+
+#EDA
+#load
+us_corpus<-loadCorpus("./","^en*")
+#initial info
+us_corpus_info<-corpusInfo(us_corpus)
+#take sample
+us_corpus_samp<-sampleCorpus(us_corpus,20000)
+#clean
+us_corpus_samp<-cleanCorpus(us_corpus_samp)
+#unigram dtm
+uni_dtm<-unigramDTM(us_corpus_samp)
+#bigram dtm
+bi_dtm<-bigramDTM(us_corpus_samp)
+#trigram dtm
+tri_dtm<-trigramDTM(us_corpus_samp)
+#dtm info
+us_corpus_samp_info<-dtmInfo(uni_dtm[[2]])
+#corpus term frequence histogram
+uni_hist<-histChart(uni_dtm[[2]],"Unigrams")
+bi_hist<-histChart(bi_dtm[[2]],"Bigrams")
+tri_hist<-histChart(tri_dtm[[2]],"Trigrams")
+#corpus most frequent NGrams chart
+uni_freqw<-wdsChart(uni_dtm[[2]],"Unigrams")
+bi_freqw<-wdsChart(bi_dtm[[2]],"Bigrams")
+tri_freqw<-wdsChart(tri_dtm[[2]],"Trigrams")
+
+
+
+
+
+
+
+```
+
+
+
+## Sysnopsis
+The Data Science Capstone is a final project of the JHU Data Science 
+Specialization. The goal of the project is to build the context-based 
+text input recognition system similar to those created by Swiftkey 
+(text recognition software company partnering with JHU).
+
+This report is devoted to the initial stages of the project: strategy 
+development and data exploration. Strategy development is the outline of the 
+general approach applied to the data collection, prediction algorithm and UI 
+creation. Data exploration is the first step of the strategy execution - 
+it includes the ETL and EDA.
+
+##Strategy Development
+The goal of the project is to build a data product - the context-based text input 
+recommendation system, i.e. the program with UI that takes the user's text input 
+and outputs the recommendation on the next word (next word prediction).
+The steps required to achieve the goal are defined as follows:
+
+1. Define the scope of the project, ie. languages, target devices, etc.
+2. Obtain the data (text corpus) representative of the language (or languages) 
+chosen.
+3. Create and train the predictive algorithm (model) to be used to create the 
+tool engine.
+4. Create the UI for the target devices identified in scope.
+
+###Scope of the Project
+The project is limited to **English** language text input prediction. However, it 
+should be designed in a way allowing for fast switch to any other language, i.e. 
+no major coding effort should be needed for the implementation of different 
+language corpus.
+
+The text prediction algorithm should give the accurate predictions, but should 
+not require wast computing resources. The compromise between the speed and 
+accuracy should be found. **Note:** the algorithm should produce only the 
+next word recommendation, the partial word auto-complete recommendations are not 
+the part of this project.
+
+The UI is limited to the web browser demonstartional interface. there is no plan
+to implement compatibility libraries for the side programs, such as iPhone 
+keyboard, or similar.
+
+###The Data
+The data source for this project is chosen to be the [HC Corpora language database](http://www.corpora.heliohost.org/aboutcorpus.html). It contains the raw 
+text data for multiple languages obtained by the web crawler. The main sources are:
+
+* News - news sites/aggregators;
+* Blogs - blogging resources;
+* Twitter.
+
+As per scope of this project, we will be using the English part of the corpus to 
+train our prediction algorithm. we will be differentiating the different types of 
+text sources only while data exploration - further the whole corpus will be 
+treated as one.
+
+###The Algorithm
+In order to create the predictions of the next word, we will be assuming that 
+the every next word depends on sort sequence of previous words, i.e. we will 
+be using the Markov assumption.
+
+Basing the model on the assumption defined above, we will produce a set of 
+N-Grams from the text corpus (the sequences of words of length N) and will assign 
+probability to every word based on N-1 preceding words. A bit deeper description 
+of methodology can be found here: [Stanford NLP Course by E. Roberts](http://cs.stanford.edu/people/eroberts/courses/soco/projects/2004-05/nlp/techniques_word.html).
+As we have the limited computing resources, we will be limiting N to 3 (trigram) or 
+even 2 (bigram).
+
+Overall, the algorithm will be as follows:
+
+1. Take the text input;
+2. Extract last two words (in case we choose tri-grams);
+3. Check probability of a tri-gram intersected with the bi-gram taken as input;
+4. Output the last word in the tri-gram with highest probability.
+
+###The UI
+The User Interface will be a simple browser-based **Shiny App**. It will have an 
+R code in the back-end and Shiny front-end.
+
+
+##ETL and EDA
+
+As a first step within the strategy implementation we load the data (ETL Extract, 
+Transform, Load) and explore it (EDA- Exploratory Data Analysis).
+The data is loaded directly from the source in form of archive, unpacked and 
+loaded into the programming environment. This what the loaded data looks like:
+```{r,echo=FALSE,comment="",message=FALSE}
+us_corpus_info
+```
+
+Once we load the text corpus, we prepare it to further use in the project by 
+cleaning. We do the following:
+
+* Translate everything to lower case;
+* Remove stop words;
+* remove punctuation and special characters;
+* Remove numbers;
+* Remove bad words (for English language we use the [profanity words database](http://www.cs.cmu.edu/~biglou/resources/bad-words.txt) 
+developed by Luis von Ahn's Research Group from CMU - my home school).
+
+**Note:** We do not perform stemming, as we do not want to reduce word forms - 
+this might harm our text prediction goals.
+
+**As the entire database is quite large, we will furhter use the sample to avoid** 
+**long running times and machine overload. We will be randomly taking 20000 lines** 
+**from every document, which still should be quite representative.**
+
+After the cleaning stage, this is what our data sample looks like:
+```{r,echo=FALSE,comment="",message=FALSE}
+us_corpus_samp_info
+```
+
+We can notice that this unigram bag-of-words matrix (document term matrix) is quite sparse. 
+Also, the numbers in a table above are dependent on the document total size - 
+the blogs have the largest word set while twitter has the smallest. Another 
+interesting thing would be the distribution of words in every document. If we look 
+at the number of unique words covering 90% of text, we can easily see that there 
+is long tail present in every source and also in a whole corpus - number of '90% 
+coverage' words is much lower than 90% of total unique words, i.e. most of text 
+is covered with a set of frequent terms, while the tail contains from lots of 
+infrequent ones.
+
+However, for our project we do not need to compare different sources of text 
+data. What we are interested in is the aggregation, i.e.. the whole corpus and 
+nGrams within it. As we noted before, we will use Ngrams up to order 3 in our 
+algorithm, so, below are the frequency distribution charts for unigrams (one word), 
+bigrams (two words) and trigrams (three words).
+
+```{r,echo=FALSE,comment="",message=FALSE,fig.width=12}
+grid.arrange(uni_hist, bi_hist, tri_hist, ncol=3)
+```
+
+As we can see, the unigrams are distributed better than bigrams, and bigrams, 
+in turn, distributed better than trigrams. This is quite intuitive though - 
+the more elements we have in a unit, the less is the probability to see repeated 
+combinations.
+
+Speaking of the most frequent Ngrams in our corpus sample, below are charts for 
+top 10:
+
+```{r,echo=FALSE,comment="",message=FALSE,fig.width=12}
+grid.arrange(uni_freqw, bi_freqw, tri_freqw, ncol=3)
+```
+
+Most frequent words are not very surprising. The trigrams show the most commonly 
+used idioms. However, as we eliminated many stepwords, we might have not the 
+full picture. Further in the process we will have to think if having the stepwords 
+will be beneficial (as many trigrams actually use prepositions).
+
+Finally, here is a beautiful wordcloud for the combined corpus of one to three 
+Ngrams.
+
+```{r,echo=FALSE,comment="",message=FALSE,warning=FALSE,fig.width=12}
+wordCloud(uni_dtm[[2]],bi_dtm[[2]],tri_dtm[[2]])
+```
+
+##Conclusion
+As a result of the initial project stage, the following was accomplished:
+
+1. The text input prediction tool development strategy was defined.
+2. The text corpus was loaded.
+3. The text corpus was explored and described.
+
+The following step will be the development of predictive algorithm that will be 
+based on the data described above.
+
+The code for this report can be found on my [GitHub](https://github.com/ilia-semenov) 
+in the project "DS_Capstone".
+
